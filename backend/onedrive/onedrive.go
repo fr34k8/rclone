@@ -242,6 +242,18 @@ this flag there.
 `,
 			Advanced: true,
 		}, {
+			Name: "hard_delete",
+			Help: `Permanently delete files on removal.
+
+Normally files will get sent to the recycle bin on deletion. Setting
+this flag causes them to be permanently deleted. Use with care.
+
+OneDrive personal accounts do not support the permanentDelete API,
+it only applies to OneDrive for Business and SharePoint document libraries.
+`,
+			Advanced: true,
+			Default:  false,
+		}, {
 			Name:     "link_scope",
 			Default:  "anonymous",
 			Help:     `Set the scope of the links created by the link command.`,
@@ -695,6 +707,7 @@ type Options struct {
 	ServerSideAcrossConfigs bool                 `config:"server_side_across_configs"`
 	ListChunk               int64                `config:"list_chunk"`
 	NoVersions              bool                 `config:"no_versions"`
+	HardDelete              bool                 `config:"hard_delete"`
 	LinkScope               string               `config:"link_scope"`
 	LinkType                string               `config:"link_type"`
 	LinkPassword            string               `config:"link_password"`
@@ -1479,7 +1492,12 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 // deleteObject removes an object by ID
 func (f *Fs) deleteObject(ctx context.Context, id string) error {
-	opts := f.newOptsCall(id, "DELETE", "")
+	var opts rest.Opts
+	if f.opt.HardDelete {
+		opts = f.newOptsCall(id, "POST", "/permanentDelete")
+	} else {
+		opts = f.newOptsCall(id, "DELETE", "")
+	}
 	opts.NoResponse = true
 
 	return f.pacer.Call(func() (bool, error) {
@@ -2304,11 +2322,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 }
 
 // createUploadSession creates an upload session for the object
-func (o *Object) createUploadSession(ctx context.Context, src fs.ObjectInfo, modTime time.Time) (response *api.CreateUploadResponse, err error) {
+func (o *Object) createUploadSession(ctx context.Context, src fs.ObjectInfo, modTime time.Time) (response *api.CreateUploadResponse, metadata fs.Metadata, err error) {
 	opts := o.fs.newOptsCallWithPath(ctx, o.remote, "POST", "/createUploadSession")
-	createRequest, err := o.fetchMetadataForCreate(ctx, src, opts.Options, modTime)
+	createRequest, metadata, err := o.fetchMetadataForCreate(ctx, src, opts.Options, modTime)
 	if err != nil {
-		return nil, err
+		return nil, metadata, err
 	}
 	var resp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
@@ -2321,7 +2339,7 @@ func (o *Object) createUploadSession(ctx context.Context, src fs.ObjectInfo, mod
 		}
 		return shouldRetry(ctx, resp, err)
 	})
-	return response, err
+	return response, metadata, err
 }
 
 // getPosition gets the current position in a multipart upload
@@ -2437,7 +2455,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.Objec
 
 	// Create upload session
 	fs.Debugf(o, "Starting multipart upload")
-	session, err := o.createUploadSession(ctx, src, modTime)
+	session, metadata, err := o.createUploadSession(ctx, src, modTime)
 	if err != nil {
 		return nil, err
 	}
@@ -2474,10 +2492,10 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.Objec
 	if err != nil {
 		return info, err
 	}
-	if !o.fs.opt.MetadataPermissions.IsSet(rwWrite) {
+	if metadata == nil || !o.fs.needsUpdatePermissions(metadata) {
 		return info, err
 	}
-	info, err = o.fs.fetchAndUpdatePermissions(ctx, src, options, o) // for permissions, which can't be set during original upload
+	info, err = o.updateMetadata(ctx, metadata) // for permissions, which can't be set during original upload
 	if info == nil {
 		return nil, err
 	}
@@ -2520,6 +2538,9 @@ func (o *Object) uploadSinglepart(ctx context.Context, in io.Reader, src fs.Obje
 	}
 	// Set the mod time now and read metadata
 	info, err = o.fs.fetchAndUpdateMetadata(ctx, src, options, o)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch and update metadata: %w", err)
+	}
 	return info, o.setMetaData(info)
 }
 
